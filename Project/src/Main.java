@@ -1,2 +1,2 @@
-void main() {System.exit(0);
+void main(){
 }
