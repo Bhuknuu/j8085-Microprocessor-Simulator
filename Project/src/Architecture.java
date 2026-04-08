@@ -1,1306 +1,852 @@
 import java.util.HashMap;
-import java.util.Map;
 
-/**
- * ╔═══════════════════════════════════════════════════════════════════════════╗
- * ║                    ARCHITECTURE — 8085 SIMULATOR CORE                    ║
- * ╠═══════════════════════════════════════════════════════════════════════════╣
- * ║  PURPOSE:                                                                ║
- * ║  The HEART of the simulator. This class represents the entire 8085      ║
- * ║  CPU — registers, memory, ALU, program counter, stack pointer,          ║
- * ║  and the execution engine (fetch-decode-execute cycle).                  ║
- * ║                                                                          ║
- * ║  It implements TWO interfaces:                                           ║
- * ║    Memory    → gives it memory read/write/reset capabilities            ║
- * ║    InstrucSet → gives it all 74 instruction implementations             ║
- * ║                                                                          ║
- * ║  REAL HARDWARE CONTEXT:                                                  ║
- * ║  The 8085A microprocessor (Intel, 1976) is a complete CPU on a chip:     ║
- * ║    - 8-bit data bus, 16-bit address bus                                  ║
- * ║    - 6 general-purpose registers (B,C,D,E,H,L)                         ║
- * ║    - 1 accumulator (A) — primary register for arithmetic                ║
- * ║    - 1 flag register (F) — stores condition flags (S,Z,AC,P,CY)        ║
- * ║    - 2 temporary registers (W, Z) — used internally by CPU             ║
- * ║    - 16-bit program counter (PC) — points to next instruction           ║
- * ║    - 16-bit stack pointer (SP) — points to top of stack in memory       ║
- * ║                                                                          ║
- * ║  DESIGN DECISIONS:                                                       ║
- * ║  ┌─────────────────────────────────────────────────────────────┐         ║
- * ║  │ Data Structure    │ Why                                     │         ║
- * ║  ├─────────────────────────────────────────────────────────────┤         ║
- * ║  │ HashMap<String, Integer> for registers                     │         ║
- * ║  │   → Easy access by name ("A", "B", etc.)                  │         ║
- * ║  │   → O(1) lookup, clean code with registerGet("A")         │         ║
- * ║  │ int[] for memory                                           │         ║
- * ║  │   → Direct indexed access mimics real hardware addresses  │         ║
- * ║  │   → memory[0x2000] = value is natural and fast            │         ║
- * ║  │ ALU object for computations                                │         ║
- * ║  │   → Separates computation from state management           │         ║
- * ║  └─────────────────────────────────────────────────────────────┘         ║
- * ╚═══════════════════════════════════════════════════════════════════════════╝
- */
+// Architecture — The 8085 CPU core: registers, memory, ALU, and fetch-decode-execute engine
 public class Architecture implements Memory, InstrucSet {
 
-    // ╔═══════════════════════════════════════════════════════════════╗
-    // ║  SECTION 1: REGISTER FILE                                    ║
-    // ╚═══════════════════════════════════════════════════════════════╝
+    // Register file
+    private HashMap<String, Integer> generalRegisters; // B, C, D, E, H, L
+    private HashMap<String, Integer> specialRegisters; // A, W, Z
+    private int programCounter;
+    private int stackPointer;
 
-    /**
-     * General-purpose 8-bit registers: B, C, D, E, H, L
-     *
-     * PAIRS: In the 8085, these registers pair up to form 16-bit addresses:
-     *   BC pair = B (high) + C (low) → used for indirect addressing
-     *   DE pair = D (high) + E (low) → used for indirect addressing
-     *   HL pair = H (high) + L (low) → used as memory pointer ("M")
-     *
-     * KEY: register name (String) → VALUE: 8-bit value (int, 0x00-0xFF)
-     */
-    private HashMap<String, Integer> generalRegisters;
-
-    /**
-     * Special 8-bit registers: A (Accumulator), W, Z (internal temp)
-     *
-     * A (Accumulator): The primary working register. ALL arithmetic and
-     *   logical operations have A as one operand and store results in A.
-     *   It is THE most important register in the 8085.
-     *
-     * W, Z (Temporary): Internal CPU registers not accessible to the
-     *   programmer. The CPU uses them during multi-byte instruction execution.
-     *   Example: During LDA 2050H, the CPU uses W and Z to hold the
-     *   address bytes while fetching them from memory.
-     */
-    private HashMap<String, Integer> specialRegisters;
-
-    /**
-     * 16-bit registers stored as integers:
-     *
-     * Program Counter (PC): Points to the address of the NEXT instruction
-     *   to fetch from memory. After each instruction, PC advances by the
-     *   instruction's byte length (1, 2, or 3).
-     *
-     * Stack Pointer (SP): Points to the TOP of the stack in memory.
-     *   The stack grows DOWNWARD (from high addresses to low addresses).
-     *   PUSH decreases SP; POP increases SP.
-     *   Typically initialized to a high memory address (e.g., 0xFFFF).
-     */
-    private int programCounter;  // PC: 0x0000 to 0xFFFF
-    private int stackPointer;    // SP: 0x0000 to 0xFFFF
-
-    // ╔═══════════════════════════════════════════════════════════════╗
-    // ║  SECTION 2: MEMORY                                           ║
-    // ╚═══════════════════════════════════════════════════════════════╝
-
-    /**
-     * Main memory array.
-     *
-     * STRUCTURE: Simple int array where index = address, value = data byte.
-     *   memory[0x0000] = first byte
-     *   memory[0xFFFF] = last byte (for 64KB)
-     *
-     * WHY ARRAY (not HashMap):
-     *   Arrays mimic real hardware memory — direct indexed access, O(1) read/write,
-     *   and contiguous storage just like physical RAM chips.
-     *
-     * RANGE: Allocated based on constructor parameter (default or custom).
-     */
+    // Memory
     private int[] memory;
+    private int memoryStart;
+    private int memoryEnd;
 
-    /** Start address of allocated memory (default: 0x0000) */
-    private int memoryStartAddress;
-
-    /** End address of allocated memory (default: 0xFFFF) */
-    private int memoryEndAddress;
-
-    // ╔═══════════════════════════════════════════════════════════════╗
-    // ║  SECTION 3: ALU AND STATE                                    ║
-    // ╚═══════════════════════════════════════════════════════════════╝
-
-    /**
-     * The Arithmetic Logic Unit — handles all computations and flags.
-     */
+    // Subsystems
     private ALU alu;
-
-    /**
-     * I/O Ports — simulates the 256 input/output ports of the 8085.
-     * KEY: port number (0x00-0xFF) → VALUE: byte stored at that port
-     */
+    private boolean halted;
+    private boolean interruptsEnabled;
     private HashMap<Integer, Integer> ioPorts;
 
-    /**
-     * CPU state flags (not to be confused with the ALU's condition flags).
-     */
-    private boolean halted;             // true when HLT instruction executes
-    private boolean interruptsEnabled;  // true when EI has been called
-
-    // ╔═══════════════════════════════════════════════════════════════╗
-    // ║  SECTION 4: CONSTRUCTORS                                     ║
-    // ╚═══════════════════════════════════════════════════════════════╝
-
-    /**
-     * CONSTRUCTOR 1: Default Memory Range (Full 64KB: 0000H to FFFFH)
-     *
-     * LOGIC:
-     *   1. Allocate memory array of size MAX_MEMORY_SIZE (65536)
-     *   2. Initialize all registers to 0x00
-     *   3. Set PC = 0x0000 (start executing from address 0)
-     *   4. Set SP = 0xFFFF (stack starts at top of memory)
-     *   5. Create ALU instance
-     *   6. Initialize I/O ports map
-     *   7. Set halted = false, interruptsEnabled = false
-     *
-     * USE CASE: Standard simulator mode — full 8085 memory space.
-     */
+    // Default constructor: 64KB
     public Architecture() {
-        // TODO: Call the parameterized constructor with default values
-        //   this(DEFAULT_START_ADDRESS, DEFAULT_END_ADDRESS);
-
-        // OR initialize everything directly:
-
-        // TODO: Step 1 — Initialize memory
-        // this.memoryStartAddress = DEFAULT_START_ADDRESS;
-        // this.memoryEndAddress = DEFAULT_END_ADDRESS;
-        // this.memory = new int[MAX_MEMORY_SIZE];
-
-        // TODO: Step 2 — Initialize registers
-        // initRegisters();
-
-        // TODO: Step 3 — Initialize 16-bit registers
-        // this.programCounter = 0x0000;
-        // this.stackPointer = 0xFFFF;
-
-        // TODO: Step 4 — Initialize ALU
-        // this.alu = new ALU();
-
-        // TODO: Step 5 — Initialize I/O ports
-        // this.ioPorts = new HashMap<>();
-
-        // TODO: Step 6 — Initialize state
-        // this.halted = false;
-        // this.interruptsEnabled = false;
+        this.memoryStart = DEFAULT_START_ADDRESS;
+        this.memoryEnd = DEFAULT_END_ADDRESS;
+        this.memory = new int[MAX_MEMORY_SIZE];
+        init();
     }
 
-    /**
-     * CONSTRUCTOR 2: Custom Memory Range.
-     *
-     * LOGIC:
-     *   Same as default but allocates only (endAddr - startAddr + 1) bytes.
-     *   Validates that startAddr < endAddr and both are within 0x0000-0xFFFF.
-     *
-     * USE CASE: For educational demos with limited memory (e.g., 0x2000-0x20FF
-     *   gives just 256 bytes — easier to visualize in the UI).
-     *
-     * @param startAddr  Base address of memory
-     * @param endAddr    Top address of memory
-     * @throws SimulatorException if addresses are invalid
-     */
-    public Architecture(int startAddr, int endAddr) throws SimulatorException {
-        // TODO: Validate parameters
-        //   if (startAddr < 0 || endAddr > 0xFFFF || startAddr >= endAddr)
-        //       throw new SimulatorException("Invalid memory range", ErrorType.INVALID_MEMORY_ADDRESS);
-
-        // TODO: Same initialization as default constructor but with custom range
-        //   this.memoryStartAddress = startAddr;
-        //   this.memoryEndAddress = endAddr;
-        //   this.memory = new int[endAddr - startAddr + 1];
-        //   ... rest of initialization ...
+    // Custom range constructor
+    public Architecture(int startAddress, int endAddress) throws SimulatorException {
+        if (startAddress < 0 || endAddress > 0xFFFF || startAddress > endAddress)
+            throw new SimulatorException("Invalid memory range",
+                    SimulatorException.ErrorType.InvalidMemoryAddress);
+        this.memoryStart = startAddress;
+        this.memoryEnd = endAddress;
+        this.memory = new int[MAX_MEMORY_SIZE];
+        init();
     }
 
-    /**
-     * Initializes all register HashMaps with default values (0x00).
-     *
-     * LOGIC:
-     *   General registers: {"B":0, "C":0, "D":0, "E":0, "H":0, "L":0}
-     *   Special registers: {"A":0, "W":0, "Z":0}
-     */
+    private void init() {
+        generalRegisters = new HashMap<>();
+        specialRegisters = new HashMap<>();
+        alu = new ALU();
+        ioPorts = new HashMap<>();
+        initRegisters();
+        programCounter = 0x0000;
+        stackPointer = 0xFFFF;
+        halted = false;
+        interruptsEnabled = false;
+    }
+
     private void initRegisters() {
-        // TODO: Initialize general purpose register map
-        //   generalRegisters = new HashMap<>();
-        //   String[] gpRegs = {"B", "C", "D", "E", "H", "L"};
-        //   for (String reg : gpRegs) { generalRegisters.put(reg, 0x00); }
-
-        // TODO: Initialize special register map
-        //   specialRegisters = new HashMap<>();
-        //   specialRegisters.put("A", 0x00);
-        //   specialRegisters.put("W", 0x00);
-        //   specialRegisters.put("Z", 0x00);
+        for (String r : new String[]{"B", "C", "D", "E", "H", "L"})
+            generalRegisters.put(r, 0);
+        for (String r : new String[]{"A", "W", "Z"})
+            specialRegisters.put(r, 0);
     }
 
-    // ╔═══════════════════════════════════════════════════════════════╗
-    // ║  SECTION 5: REGISTER ACCESS HELPERS                          ║
-    // ║  These simplify reading/writing registers throughout the     ║
-    // ║  instruction implementations.                                ║
-    // ╚═══════════════════════════════════════════════════════════════╝
-
-    /**
-     * Gets the value of any 8-bit register by name.
-     *
-     * LOGIC:
-     *   1. Check if name is in generalRegisters → return its value
-     *   2. Else check specialRegisters → return its value
-     *   3. Else throw SimulatorException for invalid register name
-     *
-     * @param name  Register name ("A","B","C","D","E","H","L","W","Z")
-     * @return      The 8-bit value in that register
-     * @throws SimulatorException if register name is invalid
-     */
-    public int getRegister(String name) throws SimulatorException {
-        // TODO: Implement register lookup across both maps
-        //
-        // name = name.toUpperCase();
-        // if (generalRegisters.containsKey(name)) return generalRegisters.get(name);
-        // if (specialRegisters.containsKey(name)) return specialRegisters.get(name);
-        // throw new SimulatorException("Invalid register: " + name, ErrorType.INVALID_REGISTER);
-        return 0; // placeholder
-    }
-
-    /**
-     * Sets the value of any 8-bit register by name.
-     *
-     * @param name   Register name
-     * @param value  8-bit value (0x00-0xFF)
-     * @throws SimulatorException if invalid register or value out of range
-     */
-    public void setRegister(String name, int value) throws SimulatorException {
-        // TODO: Validate value is 0x00-0xFF, then store in appropriate map
-        //
-        // if (value < 0x00 || value > 0xFF)
-        //     throw new SimulatorException("Value out of 8-bit range: " + value, ErrorType.INVALID_DATA);
-        // name = name.toUpperCase();
-        // if (generalRegisters.containsKey(name)) { generalRegisters.put(name, value); return; }
-        // if (specialRegisters.containsKey(name)) { specialRegisters.put(name, value); return; }
-        // throw new SimulatorException("Invalid register: " + name, ErrorType.INVALID_REGISTER);
-    }
-
-    /**
-     * Gets the 16-bit value of a register pair.
-     *
-     * LOGIC: Combine high and low registers:
-     *   value = (highReg << 8) | lowReg
-     *   "B" pair → B*256 + C
-     *   "D" pair → D*256 + E
-     *   "H" pair → H*256 + L
-     *   "SP"     → stackPointer
-     *
-     * @param pair  Register pair identifier ("B","D","H","SP")
-     * @return      16-bit combined value
-     * @throws SimulatorException if invalid pair name
-     */
-    public int getRegisterPair(String pair) throws SimulatorException {
-        // TODO: Implement register pair value computation
-        //
-        // switch (pair.toUpperCase()) {
-        //     case "B": return (getRegister("B") << 8) | getRegister("C");
-        //     case "D": return (getRegister("D") << 8) | getRegister("E");
-        //     case "H": return (getRegister("H") << 8) | getRegister("L");
-        //     case "SP": return stackPointer;
-        //     default: throw new SimulatorException("Invalid register pair: " + pair);
-        // }
-        return 0; // placeholder
-    }
-
-    /**
-     * Sets a 16-bit register pair value.
-     *
-     * LOGIC: Split 16-bit value into high and low bytes:
-     *   highByte = (value >> 8) & 0xFF
-     *   lowByte  = value & 0xFF
-     *
-     * @param pair   Register pair identifier
-     * @param value  16-bit value (0x0000-0xFFFF)
-     * @throws SimulatorException if invalid pair or value
-     */
-    public void setRegisterPair(String pair, int value) throws SimulatorException {
-        // TODO: Split value and store in the pair's registers
-        //
-        // int high = (value >> 8) & 0xFF;
-        // int low  = value & 0xFF;
-        // switch (pair.toUpperCase()) {
-        //     case "B": setRegister("B", high); setRegister("C", low); break;
-        //     case "D": setRegister("D", high); setRegister("E", low); break;
-        //     case "H": setRegister("H", high); setRegister("L", low); break;
-        //     case "SP": stackPointer = value & 0xFFFF; break;
-        //     default: throw new SimulatorException("Invalid register pair: " + pair);
-        // }
-    }
-
-    /**
-     * Gets the 16-bit value of the HL pair.
-     * This is used SO frequently (HL = memory pointer) that it
-     * deserves its own convenience method.
-     *
-     * @return H*256 + L
-     * @throws SimulatorException if register access fails
-     */
-    public int getHL() throws SimulatorException {
-        return getRegisterPair("H");
-    }
-
-    /**
-     * Gets the value of an operand which may be a register name OR "M".
-     * "M" means "memory location pointed to by HL".
-     *
-     * LOGIC:
-     *   if (operand == "M") → return memory[HL]
-     *   else                → return register[operand]
-     *
-     * This pattern is used by EVERY arithmetic/logical instruction.
-     *
-     * @param operand  Register name or "M"
-     * @return         The 8-bit value
-     * @throws SimulatorException if invalid operand
-     */
-    public int getOperandValue(String operand) throws SimulatorException {
-        // TODO: Implement the M-or-register pattern
-        //
-        // if (operand.equalsIgnoreCase("M")) {
-        //     return readMemory(getHL());
-        // } else {
-        //     return getRegister(operand);
-        // }
-        return 0; // placeholder
-    }
-
-    /**
-     * Sets the value of an operand which may be a register name OR "M".
-     *
-     * @param operand  Register name or "M"
-     * @param value    8-bit value to store
-     * @throws SimulatorException if invalid operand
-     */
-    public void setOperandValue(String operand, int value) throws SimulatorException {
-        // TODO: Implement set for M-or-register
-        //
-        // if (operand.equalsIgnoreCase("M")) {
-        //     writeMemory(getHL(), value);
-        // } else {
-        //     setRegister(operand, value);
-        // }
-    }
-
-
-    // ╔═══════════════════════════════════════════════════════════════╗
-    // ║  SECTION 6: MEMORY INTERFACE IMPLEMENTATION                  ║
-    // ╚═══════════════════════════════════════════════════════════════╝
+    // ─── Memory Interface ────────────────────────────────────────
 
     @Override
     public int readMemory(int address) throws SimulatorException {
-        // TODO: Validate address, then return memory[address - memoryStartAddress]
-        //
-        // if (address < memoryStartAddress || address > memoryEndAddress) {
-        //     throw new SimulatorException(
-        //         "Memory read out of bounds: 0x" + Integer.toHexString(address),
-        //         SimulatorException.ErrorType.INVALID_MEMORY_ADDRESS, address);
-        // }
-        // return memory[address - memoryStartAddress];
-        return 0; // placeholder
+        validateAddress(address);
+        return memory[address] & 0xFF;
     }
 
     @Override
     public void writeMemory(int address, int data) throws SimulatorException {
-        // TODO: Validate address and data, then store
-        //
-        // if (address < memoryStartAddress || address > memoryEndAddress) {
-        //     throw new SimulatorException(...);
-        // }
-        // if (data < 0x00 || data > 0xFF) {
-        //     throw new SimulatorException("Data out of byte range: " + data, ErrorType.INVALID_DATA);
-        // }
-        // memory[address - memoryStartAddress] = data;
+        validateAddress(address);
+        memory[address] = data & 0xFF;
     }
 
     @Override
-    public void resetMemory() {
-        // TODO: Fill the entire memory array with 0
-        //   java.util.Arrays.fill(memory, 0x00);
-    }
+    public void resetMemory() { memory = new int[MAX_MEMORY_SIZE]; }
 
     @Override
-    public int[] getMemoryDump() {
-        // TODO: Return a defensive copy
-        //   return java.util.Arrays.copyOf(memory, memory.length);
-        return new int[0]; // placeholder
-    }
+    public int[] getMemoryDump() { return memory.clone(); }
 
     @Override
-    public int getMemoryStart() {
-        return memoryStartAddress;
-    }
+    public int getMemoryStart() { return memoryStart; }
 
     @Override
-    public int getMemoryEnd() {
-        return memoryEndAddress;
-    }
+    public int getMemoryEnd() { return memoryEnd; }
 
     @Override
     public void loadProgram(int startAddress, int[] data) throws SimulatorException {
-        // TODO: Validate and copy program bytes into memory
-        //
-        // for (int i = 0; i < data.length; i++) {
-        //     writeMemory(startAddress + i, data[i]);
-        // }
+        for (int i = 0; i < data.length; i++)
+            writeMemory(startAddress + i, data[i]);
     }
 
     @Override
-    public void displayMemoryRange(int fromAddress, int toAddress) {
-        // TODO: Print formatted hex dump
-        //
-        // System.out.printf("%-6s", "ADDR");
-        // for (int col = 0; col < 16; col++) System.out.printf(" %02X", col);
-        // System.out.println();
-        // System.out.println("─".repeat(54));
-        //
-        // for (int addr = fromAddress; addr <= toAddress; addr += 16) {
-        //     System.out.printf("%04X: ", addr);
-        //     for (int col = 0; col < 16 && (addr + col) <= toAddress; col++) {
-        //         try {
-        //             System.out.printf(" %02X", readMemory(addr + col));
-        //         } catch (SimulatorException e) {
-        //             System.out.printf(" ??");
-        //         }
-        //     }
-        //     System.out.println();
-        // }
+    public void displayMemoryRange(int from, int to) {
+        from = Math.max(from, 0);
+        to = Math.min(to, 0xFFFF);
+        System.out.printf("      00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F%n");
+        int rowStart = from & 0xFFF0;
+        for (int addr = rowStart; addr <= to; addr += 16) {
+            System.out.printf("%04X: ", addr);
+            for (int col = 0; col < 16 && (addr + col) <= 0xFFFF; col++)
+                System.out.printf("%02X ", memory[addr + col]);
+            System.out.println();
+        }
     }
 
-
-    // ╔═══════════════════════════════════════════════════════════════╗
-    // ║  SECTION 7: EXECUTION ENGINE                                 ║
-    // ║  The fetch-decode-execute cycle — the HEARTBEAT of the CPU.  ║
-    // ╚═══════════════════════════════════════════════════════════════╝
-
-    /**
-     * Executes one instruction at the current Program Counter.
-     *
-     * THIS IS THE CORE EXECUTION METHOD.
-     *
-     * THE FETCH - DECODE - EXECUTE CYCLE:
-     * ┌─────────────────────────────────────────────────────────┐
-     * │ FETCH:   Read opcode byte from memory[PC]              │
-     * │ DECODE:  Determine which instruction this opcode is     │
-     * │ EXECUTE: Perform the operation, update registers/memory │
-     * │ ADVANCE: Move PC to the next instruction               │
-     * └─────────────────────────────────────────────────────────┘
-     *
-     * LOGIC:
-     *   1. Fetch: int opcode = readMemory(programCounter);
-     *   2. Decode: Use a large switch statement on the opcode value
-     *   3. For single-byte instructions (e.g., MOV, ADD): just execute
-     *   4. For 2-byte instructions (e.g., MVI): fetch operand at PC+1
-     *   5. For 3-byte instructions (e.g., JMP, LDA): fetch 2 bytes at PC+1, PC+2
-     *   6. Advance PC by the instruction's byte-length (1, 2, or 3)
-     *      EXCEPT for branch instructions that modify PC directly
-     *
-     * @throws SimulatorException if invalid opcode or execution error
-     */
-    public void executeInstruction() throws SimulatorException {
-        // TODO: Implement the fetch-decode-execute cycle
-        //
-        // if (halted) return;  // Don't execute if CPU is halted
-        //
-        // // === FETCH ===
-        // int opcode = readMemory(programCounter);
-        //
-        // // === DECODE & EXECUTE ===
-        // switch (opcode) {
-        //
-        //     // --- NOP ---
-        //     case 0x00: nop(); programCounter += 1; break;
-        //
-        //     // --- LXI B, d16 ---
-        //     case 0x01: {
-        //         int low  = readMemory(programCounter + 1);
-        //         int high = readMemory(programCounter + 2);
-        //         lxi("B", (high << 8) | low);
-        //         programCounter += 3;
-        //         break;
-        //     }
-        //
-        //     // --- STAX B ---
-        //     case 0x02: stax("B"); programCounter += 1; break;
-        //
-        //     // --- INX B ---
-        //     case 0x03: inx("B"); programCounter += 1; break;
-        //
-        //     // ... CONTINUE FOR ALL 256 OPCODES ...
-        //     // ... This is the largest single method in the project ...
-        //     // ... Consider organizing by opcode range or using helper methods ...
-        //
-        //     // --- MOV B,B (0x40) through MOV A,A (0x7F) ---
-        //     //     Except 0x76 which is HLT
-        //     //     Pattern: dest = (opcode >> 3) & 0x07, src = opcode & 0x07
-        //     //     Register encoding: 0=B, 1=C, 2=D, 3=E, 4=H, 5=L, 6=M, 7=A
-        //
-        //     // --- HLT ---
-        //     case 0x76: hlt(); programCounter += 1; break;
-        //
-        //     // --- Unknown opcode ---
-        //     default:
-        //         throw new SimulatorException(
-        //             "Unknown opcode: 0x" + String.format("%02X", opcode),
-        //             SimulatorException.ErrorType.INVALID_OPCODE, programCounter);
-        // }
+    private void validateAddress(int address) throws SimulatorException {
+        if (address < 0 || address > 0xFFFF)
+            throw new SimulatorException("Address out of range: " + Integer.toHexString(address),
+                    SimulatorException.ErrorType.InvalidMemoryAddress, address);
     }
 
-    /**
-     * Runs the processor from the current PC until HLT is encountered.
-     *
-     * LOGIC:
-     *   while (!halted) {
-     *       executeInstruction();
-     *   }
-     *
-     * This is the "Run" button in the UI — continuous execution.
-     *
-     * @throws SimulatorException if any instruction fails
-     */
-    public void run() throws SimulatorException {
-        // TODO: Implement run loop
-        //
-        // halted = false;
-        // int maxInstructions = 100000;  // Safety limit to prevent infinite loops
-        // int count = 0;
-        // while (!halted && count < maxInstructions) {
-        //     executeInstruction();
-        //     count++;
-        // }
-        // if (count >= maxInstructions) {
-        //     System.out.println("WARNING: Execution limit reached. Possible infinite loop.");
-        // }
+    // ─── Register Helpers ────────────────────────────────────────
+
+    public int getRegister(String name) throws SimulatorException {
+        name = name.toUpperCase();
+        if (generalRegisters.containsKey(name)) return generalRegisters.get(name);
+        if (specialRegisters.containsKey(name)) return specialRegisters.get(name);
+        throw new SimulatorException("Invalid register: " + name,
+                SimulatorException.ErrorType.InvalidRegister);
     }
 
-    /**
-     * Runs the processor starting from a specific address.
-     *
-     * @param startAddress  Address to begin execution from
-     * @throws SimulatorException if execution fails
-     */
-    public void runFrom(int startAddress) throws SimulatorException {
-        // TODO: Set PC to startAddress, then call run()
-        //   programCounter = startAddress;
-        //   run();
+    public void setRegister(String name, int value) throws SimulatorException {
+        name = name.toUpperCase();
+        value &= 0xFF;
+        if (generalRegisters.containsKey(name)) { generalRegisters.put(name, value); return; }
+        if (specialRegisters.containsKey(name)) { specialRegisters.put(name, value); return; }
+        throw new SimulatorException("Invalid register: " + name,
+                SimulatorException.ErrorType.InvalidRegister);
     }
 
-    /**
-     * Executes a single instruction (step mode) for debugging.
-     *
-     * USE CASE: The user presses "Step" in the UI to execute one
-     * instruction at a time and observe register/memory changes.
-     *
-     * @throws SimulatorException if the instruction fails
-     */
+    // Get 16-bit register pair value
+    private int getRegisterPair(String pair) throws SimulatorException {
+        switch (pair.toUpperCase()) {
+            case "B": return (getRegister("B") << 8) | getRegister("C");
+            case "D": return (getRegister("D") << 8) | getRegister("E");
+            case "H": return (getRegister("H") << 8) | getRegister("L");
+            case "SP": return stackPointer;
+            default: throw new SimulatorException("Invalid pair: " + pair,
+                    SimulatorException.ErrorType.InvalidRegister);
+        }
+    }
+
+    // Set 16-bit register pair value
+    private void setRegisterPair(String pair, int value) throws SimulatorException {
+        value &= 0xFFFF;
+        switch (pair.toUpperCase()) {
+            case "B": setRegister("B", (value >> 8) & 0xFF); setRegister("C", value & 0xFF); break;
+            case "D": setRegister("D", (value >> 8) & 0xFF); setRegister("E", value & 0xFF); break;
+            case "H": setRegister("H", (value >> 8) & 0xFF); setRegister("L", value & 0xFF); break;
+            case "SP": stackPointer = value; break;
+            default: throw new SimulatorException("Invalid pair: " + pair,
+                    SimulatorException.ErrorType.InvalidRegister);
+        }
+    }
+
+    // HL shortcut
+    private int getHL() throws SimulatorException { return getRegisterPair("H"); }
+
+    // Get operand value: register or memory[HL]
+    private int getOperandValue(String operand) throws SimulatorException {
+        if (operand.equalsIgnoreCase("M")) return readMemory(getHL());
+        return getRegister(operand);
+    }
+
+    // Set operand value: register or memory[HL]
+    private void setOperandValue(String operand, int value) throws SimulatorException {
+        if (operand.equalsIgnoreCase("M")) writeMemory(getHL(), value);
+        else setRegister(operand, value);
+    }
+
+    // ─── Execution Engine ────────────────────────────────────────
+
+    // Fetch next byte from memory at PC, advance PC
+    private int fetchByte() throws SimulatorException {
+        int data = readMemory(programCounter);
+        programCounter = (programCounter + 1) & 0xFFFF;
+        return data;
+    }
+
+    // Fetch next 16-bit word (low byte first, little-endian)
+    private int fetchWord() throws SimulatorException {
+        int low = fetchByte();
+        int high = fetchByte();
+        return (high << 8) | low;
+    }
+
+    // Run from a specific address until HLT
+    public void runFrom(int address) throws SimulatorException {
+        programCounter = address;
+        halted = false;
+        int maxSteps = 100000; // safety limit
+        while (!halted && maxSteps-- > 0) {
+            executeInstruction();
+        }
+        if (maxSteps <= 0)
+            throw new SimulatorException("Execution limit exceeded (infinite loop?)",
+                    SimulatorException.ErrorType.InvalidData);
+    }
+
+    // Execute a single instruction (step mode)
     public void step() throws SimulatorException {
-        // TODO: Just call executeInstruction() once
-        //   executeInstruction();
+        if (!halted) executeInstruction();
     }
 
-    /**
-     * Decodes an opcode value to its mnemonic name for display.
-     *
-     * LOGIC:
-     *   Use the OpcodeTable class to look up the mnemonic.
-     *   e.g., 0x78 → "MOV A,B"
-     *
-     * USE CASE: Displaying the current instruction in the UI.
-     *
-     * @param opcode  The opcode byte
-     * @return        Mnemonic string (e.g., "MOV A,B")
-     */
+    // Disassemble an opcode for display
     public String disassemble(int opcode) {
-        // TODO: Look up opcode in OpcodeTable and return mnemonic
-        //   return OpcodeTable.getMnemonic(opcode);
-        return "???"; // placeholder
+        return OpcodeTable.getMnemonic(opcode);
     }
 
-    /**
-     * Helper: Maps register encoding (0-7 used in opcodes) to register name.
-     *
-     * THE 8085 REGISTER ENCODING (used in the opcode bit-fields):
-     *   0 = B,  1 = C,  2 = D,  3 = E
-     *   4 = H,  5 = L,  6 = M (memory via HL), 7 = A
-     *
-     * @param code  3-bit register code (0-7)
-     * @return      Register name string
-     */
-    private String regCodeToName(int code) {
-        // TODO: Implement the mapping
-        //
-        // String[] REG_NAMES = {"B", "C", "D", "E", "H", "L", "M", "A"};
-        // if (code >= 0 && code <= 7) return REG_NAMES[code];
-        // return "?";
-        return "?"; // placeholder
+    // Core fetch-decode-execute
+    private void executeInstruction() throws SimulatorException {
+        int opcode = fetchByte();
+        int byteSize = OpcodeTable.getByteSize(opcode);
+
+        switch (opcode) {
+            // NOP
+            case 0x00: nop(); break;
+
+            // LXI
+            case 0x01: lxi("B", fetchWord()); break;
+            case 0x11: lxi("D", fetchWord()); break;
+            case 0x21: lxi("H", fetchWord()); break;
+            case 0x31: lxi("SP", fetchWord()); break;
+
+            // STAX/LDAX
+            case 0x02: stax("B"); break;
+            case 0x12: stax("D"); break;
+            case 0x0A: ldax("B"); break;
+            case 0x1A: ldax("D"); break;
+
+            // INX/DCX/DAD
+            case 0x03: inx("B"); break; case 0x13: inx("D"); break;
+            case 0x23: inx("H"); break; case 0x33: inx("SP"); break;
+            case 0x0B: dcx("B"); break; case 0x1B: dcx("D"); break;
+            case 0x2B: dcx("H"); break; case 0x3B: dcx("SP"); break;
+            case 0x09: dad("B"); break; case 0x19: dad("D"); break;
+            case 0x29: dad("H"); break; case 0x39: dad("SP"); break;
+
+            // INR
+            case 0x04: inr("B"); break; case 0x0C: inr("C"); break;
+            case 0x14: inr("D"); break; case 0x1C: inr("E"); break;
+            case 0x24: inr("H"); break; case 0x2C: inr("L"); break;
+            case 0x34: inr("M"); break; case 0x3C: inr("A"); break;
+
+            // DCR
+            case 0x05: dcr("B"); break; case 0x0D: dcr("C"); break;
+            case 0x15: dcr("D"); break; case 0x1D: dcr("E"); break;
+            case 0x25: dcr("H"); break; case 0x2D: dcr("L"); break;
+            case 0x35: dcr("M"); break; case 0x3D: dcr("A"); break;
+
+            // MVI
+            case 0x06: mvi("B", fetchByte()); break; case 0x0E: mvi("C", fetchByte()); break;
+            case 0x16: mvi("D", fetchByte()); break; case 0x1E: mvi("E", fetchByte()); break;
+            case 0x26: mvi("H", fetchByte()); break; case 0x2E: mvi("L", fetchByte()); break;
+            case 0x36: mvi("M", fetchByte()); break; case 0x3E: mvi("A", fetchByte()); break;
+
+            // Rotate/DAA/CMA/STC/CMC
+            case 0x07: rlc(); break; case 0x0F: rrc(); break;
+            case 0x17: ral(); break; case 0x1F: rar(); break;
+            case 0x27: daa(); break; case 0x2F: cma(); break;
+            case 0x37: stc(); break; case 0x3F: cmc(); break;
+
+            // RIM/SIM
+            case 0x20: rim(); break;
+            case 0x30: sim(); break;
+
+            // Direct addressing
+            case 0x22: shld(fetchWord()); break;
+            case 0x2A: lhld(fetchWord()); break;
+            case 0x32: sta(fetchWord()); break;
+            case 0x3A: lda(fetchWord()); break;
+
+            // HLT
+            case 0x76: hlt(); break;
+
+            // XCHG
+            case 0xEB: xchg(); break;
+
+            // ADD 0x80-0x87
+            case 0x80: add("B"); break; case 0x81: add("C"); break;
+            case 0x82: add("D"); break; case 0x83: add("E"); break;
+            case 0x84: add("H"); break; case 0x85: add("L"); break;
+            case 0x86: add("M"); break; case 0x87: add("A"); break;
+
+            // ADC 0x88-0x8F
+            case 0x88: adc("B"); break; case 0x89: adc("C"); break;
+            case 0x8A: adc("D"); break; case 0x8B: adc("E"); break;
+            case 0x8C: adc("H"); break; case 0x8D: adc("L"); break;
+            case 0x8E: adc("M"); break; case 0x8F: adc("A"); break;
+
+            // SUB 0x90-0x97
+            case 0x90: sub("B"); break; case 0x91: sub("C"); break;
+            case 0x92: sub("D"); break; case 0x93: sub("E"); break;
+            case 0x94: sub("H"); break; case 0x95: sub("L"); break;
+            case 0x96: sub("M"); break; case 0x97: sub("A"); break;
+
+            // SBB 0x98-0x9F
+            case 0x98: sbb("B"); break; case 0x99: sbb("C"); break;
+            case 0x9A: sbb("D"); break; case 0x9B: sbb("E"); break;
+            case 0x9C: sbb("H"); break; case 0x9D: sbb("L"); break;
+            case 0x9E: sbb("M"); break; case 0x9F: sbb("A"); break;
+
+            // ANA 0xA0-0xA7
+            case 0xA0: ana("B"); break; case 0xA1: ana("C"); break;
+            case 0xA2: ana("D"); break; case 0xA3: ana("E"); break;
+            case 0xA4: ana("H"); break; case 0xA5: ana("L"); break;
+            case 0xA6: ana("M"); break; case 0xA7: ana("A"); break;
+
+            // XRA 0xA8-0xAF
+            case 0xA8: xra("B"); break; case 0xA9: xra("C"); break;
+            case 0xAA: xra("D"); break; case 0xAB: xra("E"); break;
+            case 0xAC: xra("H"); break; case 0xAD: xra("L"); break;
+            case 0xAE: xra("M"); break; case 0xAF: xra("A"); break;
+
+            // ORA 0xB0-0xB7
+            case 0xB0: ora("B"); break; case 0xB1: ora("C"); break;
+            case 0xB2: ora("D"); break; case 0xB3: ora("E"); break;
+            case 0xB4: ora("H"); break; case 0xB5: ora("L"); break;
+            case 0xB6: ora("M"); break; case 0xB7: ora("A"); break;
+
+            // CMP 0xB8-0xBF
+            case 0xB8: cmp("B"); break; case 0xB9: cmp("C"); break;
+            case 0xBA: cmp("D"); break; case 0xBB: cmp("E"); break;
+            case 0xBC: cmp("H"); break; case 0xBD: cmp("L"); break;
+            case 0xBE: cmp("M"); break; case 0xBF: cmp("A"); break;
+
+            // Immediate arithmetic/logical
+            case 0xC6: adi(fetchByte()); break;
+            case 0xCE: aci(fetchByte()); break;
+            case 0xD6: sui(fetchByte()); break;
+            case 0xDE: sbi(fetchByte()); break;
+            case 0xE6: ani(fetchByte()); break;
+            case 0xEE: xri(fetchByte()); break;
+            case 0xF6: ori(fetchByte()); break;
+            case 0xFE: cpi(fetchByte()); break;
+
+            // Branching — JMP/Jcc
+            case 0xC3: jmp(fetchWord()); break;
+            case 0xC2: jnz(fetchWord()); break;
+            case 0xCA: jz(fetchWord()); break;
+            case 0xD2: jnc(fetchWord()); break;
+            case 0xDA: jc(fetchWord()); break;
+            case 0xE2: jpo(fetchWord()); break;
+            case 0xEA: jpe(fetchWord()); break;
+            case 0xF2: jp(fetchWord()); break;
+            case 0xFA: jm(fetchWord()); break;
+
+            // CALL/Ccc
+            case 0xCD: call(fetchWord()); break;
+            case 0xC4: cnz(fetchWord()); break;
+            case 0xCC: cz(fetchWord()); break;
+            case 0xD4: cnc(fetchWord()); break;
+            case 0xDC: cc(fetchWord()); break;
+            case 0xE4: cpo(fetchWord()); break;
+            case 0xEC: cpe(fetchWord()); break;
+            case 0xF4: cp(fetchWord()); break;
+            case 0xFC: cm(fetchWord()); break;
+
+            // RET/Rcc
+            case 0xC9: ret(); break;
+            case 0xC0: rnz(); break;
+            case 0xC8: rz(); break;
+            case 0xD0: rnc(); break;
+            case 0xD8: rc(); break;
+            case 0xE0: rpo(); break;
+            case 0xE8: rpe(); break;
+            case 0xF0: rp(); break;
+            case 0xF8: rm(); break;
+
+            // RST
+            case 0xC7: rst(0); break; case 0xCF: rst(1); break;
+            case 0xD7: rst(2); break; case 0xDF: rst(3); break;
+            case 0xE7: rst(4); break; case 0xEF: rst(5); break;
+            case 0xF7: rst(6); break; case 0xFF: rst(7); break;
+
+            // PCHL
+            case 0xE9: pchl(); break;
+
+            // Stack
+            case 0xC5: push("B"); break; case 0xD5: push("D"); break;
+            case 0xE5: push("H"); break; case 0xF5: push("PSW"); break;
+            case 0xC1: pop("B"); break;  case 0xD1: pop("D"); break;
+            case 0xE1: pop("H"); break;  case 0xF1: pop("PSW"); break;
+            case 0xE3: xthl(); break;
+            case 0xF9: sphl(); break;
+
+            // I/O
+            case 0xDB: in(fetchByte()); break;
+            case 0xD3: out(fetchByte()); break;
+
+            // EI/DI
+            case 0xFB: ei(); break;
+            case 0xF3: di(); break;
+
+            // MOV block: 0x40-0x7F (except 0x76)
+            default:
+                if (opcode >= 0x40 && opcode <= 0x7F) {
+                    String[] regNames = {"B", "C", "D", "E", "H", "L", "M", "A"};
+                    int dest = (opcode >> 3) & 0x07;
+                    int src = opcode & 0x07;
+                    mov(regNames[dest], regNames[src]);
+                } else {
+                    throw new SimulatorException("Unknown opcode: 0x" + Integer.toHexString(opcode),
+                            SimulatorException.ErrorType.InvalidOpcode, programCounter - 1);
+                }
+        }
     }
 
-
-    // ╔═══════════════════════════════════════════════════════════════╗
-    // ║  SECTION 8: INSTRUCTION SET IMPLEMENTATION                   ║
-    // ║  Implements ALL methods from InstrucSet interface.           ║
-    // ║  Each method is the "execute" part of fetch-decode-execute.  ║
-    // ╚═══════════════════════════════════════════════════════════════╝
-
-    // ─────────────────────────────────────────────────────────────
-    //  DATA TRANSFER INSTRUCTIONS
-    // ─────────────────────────────────────────────────────────────
+    // ─── Data Transfer Instructions ──────────────────────────────
 
     @Override
     public void mov(String dest, String src) throws SimulatorException {
-        // TODO: Implement MOV
-        //
-        // 1. Get source value:  int value = getOperandValue(src);
-        // 2. Set destination:   setOperandValue(dest, value);
-        // 3. No flags affected.
-        //
-        // EDGE CASE: MOV M,M (opcode 0x76) is actually HLT, not a valid MOV.
-        //   if (dest.equals("M") && src.equals("M"))
-        //       throw new SimulatorException("MOV M,M is not valid (this is HLT)");
+        if (dest.equalsIgnoreCase("M") && src.equalsIgnoreCase("M"))
+            throw new SimulatorException("MOV M,M is invalid (HLT opcode)",
+                    SimulatorException.ErrorType.InvalidOpcode);
+        int value = getOperandValue(src);
+        setOperandValue(dest, value);
     }
 
     @Override
     public void mvi(String dest, int data) throws SimulatorException {
-        // TODO: Implement MVI
-        //   setOperandValue(dest, data);
+        setOperandValue(dest, data & 0xFF);
     }
 
     @Override
     public void lxi(String regPair, int data16) throws SimulatorException {
-        // TODO: Implement LXI
-        //   setRegisterPair(regPair, data16);
+        setRegisterPair(regPair, data16);
     }
 
     @Override
     public void lda(int address) throws SimulatorException {
-        // TODO: A = memory[address]
-        //   setRegister("A", readMemory(address));
+        setRegister("A", readMemory(address));
     }
 
     @Override
     public void sta(int address) throws SimulatorException {
-        // TODO: memory[address] = A
-        //   writeMemory(address, getRegister("A"));
+        writeMemory(address, getRegister("A"));
     }
 
     @Override
     public void lhld(int address) throws SimulatorException {
-        // TODO: L = memory[address], H = memory[address+1]
-        //   setRegister("L", readMemory(address));
-        //   setRegister("H", readMemory(address + 1));
+        setRegister("L", readMemory(address));
+        setRegister("H", readMemory(address + 1));
     }
 
     @Override
     public void shld(int address) throws SimulatorException {
-        // TODO: memory[address] = L, memory[address+1] = H
-        //   writeMemory(address, getRegister("L"));
-        //   writeMemory(address + 1, getRegister("H"));
+        writeMemory(address, getRegister("L"));
+        writeMemory(address + 1, getRegister("H"));
     }
 
     @Override
     public void ldax(String regPair) throws SimulatorException {
-        // TODO: A = memory[register_pair]
-        //   int addr = getRegisterPair(regPair);
-        //   setRegister("A", readMemory(addr));
+        setRegister("A", readMemory(getRegisterPair(regPair)));
     }
 
     @Override
     public void stax(String regPair) throws SimulatorException {
-        // TODO: memory[register_pair] = A
-        //   int addr = getRegisterPair(regPair);
-        //   writeMemory(addr, getRegister("A"));
+        writeMemory(getRegisterPair(regPair), getRegister("A"));
     }
 
     @Override
     public void xchg() {
-        // TODO: Swap D↔H and E↔L
-        //
-        // try {
-        //     int tempD = getRegister("D");
-        //     int tempE = getRegister("E");
-        //     setRegister("D", getRegister("H"));
-        //     setRegister("E", getRegister("L"));
-        //     setRegister("H", tempD);
-        //     setRegister("L", tempE);
-        // } catch (SimulatorException e) {
-        //     // Should never happen with valid register names
-        //     e.printStackTrace();
-        // }
+        try {
+            int d = getRegister("D"); int e = getRegister("E");
+            int h = getRegister("H"); int l = getRegister("L");
+            setRegister("D", h); setRegister("E", l);
+            setRegister("H", d); setRegister("L", e);
+        } catch (SimulatorException ex) { throw new RuntimeException(ex); }
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  ARITHMETIC INSTRUCTIONS
-    // ─────────────────────────────────────────────────────────────
+    // ─── Arithmetic Instructions ─────────────────────────────────
 
     @Override
     public void add(String src) throws SimulatorException {
-        // TODO: A = A + src; update all flags
-        //
-        // int a = getRegister("A");
-        // int operand = getOperandValue(src);
-        // int result = alu.add(a, operand, 0);
-        // setRegister("A", result);
+        int a = getRegister("A");
+        int operand = getOperandValue(src);
+        setRegister("A", alu.add(a, operand, 0));
     }
 
     @Override
     public void adc(String src) throws SimulatorException {
-        // TODO: A = A + src + CY
-        //
-        // int a = getRegister("A");
-        // int operand = getOperandValue(src);
-        // int carry = alu.isCarryFlag() ? 1 : 0;
-        // int result = alu.add(a, operand, carry);
-        // setRegister("A", result);
+        int a = getRegister("A");
+        int operand = getOperandValue(src);
+        setRegister("A", alu.add(a, operand, alu.isCarryFlag() ? 1 : 0));
     }
 
     @Override
     public void adi(int data) throws SimulatorException {
-        // TODO: A = A + data
-        //   Same as add() but operand is immediate data
+        int a = getRegister("A");
+        setRegister("A", alu.add(a, data, 0));
     }
 
     @Override
     public void aci(int data) throws SimulatorException {
-        // TODO: A = A + data + CY
+        int a = getRegister("A");
+        setRegister("A", alu.add(a, data, alu.isCarryFlag() ? 1 : 0));
     }
 
     @Override
     public void sub(String src) throws SimulatorException {
-        // TODO: A = A - src
-        //
-        // int a = getRegister("A");
-        // int operand = getOperandValue(src);
-        // int result = alu.subtract(a, operand, 0);
-        // setRegister("A", result);
+        int a = getRegister("A");
+        int operand = getOperandValue(src);
+        setRegister("A", alu.subtract(a, operand, 0));
     }
 
     @Override
     public void sbb(String src) throws SimulatorException {
-        // TODO: A = A - src - CY
+        int a = getRegister("A");
+        int operand = getOperandValue(src);
+        setRegister("A", alu.subtract(a, operand, alu.isCarryFlag() ? 1 : 0));
     }
 
     @Override
     public void sui(int data) throws SimulatorException {
-        // TODO: A = A - data
+        int a = getRegister("A");
+        setRegister("A", alu.subtract(a, data, 0));
     }
 
     @Override
     public void sbi(int data) throws SimulatorException {
-        // TODO: A = A - data - CY
+        int a = getRegister("A");
+        setRegister("A", alu.subtract(a, data, alu.isCarryFlag() ? 1 : 0));
     }
 
     @Override
     public void inr(String dest) throws SimulatorException {
-        // TODO: dest = dest + 1, flags except CY
-        //
-        // int value = getOperandValue(dest);
-        // int result = alu.increment(value);
-        // setOperandValue(dest, result);
+        int value = getOperandValue(dest);
+        setOperandValue(dest, alu.increment(value));
     }
 
     @Override
     public void dcr(String dest) throws SimulatorException {
-        // TODO: dest = dest - 1, flags except CY
-        //
-        // int value = getOperandValue(dest);
-        // int result = alu.decrement(value);
-        // setOperandValue(dest, result);
+        int value = getOperandValue(dest);
+        setOperandValue(dest, alu.decrement(value));
     }
 
     @Override
     public void inx(String regPair) throws SimulatorException {
-        // TODO: regPair = regPair + 1 (16-bit), no flags
-        //
-        // int value = getRegisterPair(regPair);
-        // value = (value + 1) & 0xFFFF;  // Wrap around at 0xFFFF → 0x0000
-        // setRegisterPair(regPair, value);
+        int value = getRegisterPair(regPair);
+        setRegisterPair(regPair, (value + 1) & 0xFFFF);
     }
 
     @Override
     public void dcx(String regPair) throws SimulatorException {
-        // TODO: regPair = regPair - 1 (16-bit), no flags
-        //
-        // int value = getRegisterPair(regPair);
-        // value = (value - 1) & 0xFFFF;  // Wrap around at 0x0000 → 0xFFFF
-        // setRegisterPair(regPair, value);
+        int value = getRegisterPair(regPair);
+        setRegisterPair(regPair, (value - 1) & 0xFFFF);
     }
 
     @Override
     public void dad(String regPair) throws SimulatorException {
-        // TODO: HL = HL + regPair (16-bit add), only CY affected
-        //
-        // int hl = getRegisterPair("H");
-        // int rp = getRegisterPair(regPair);
-        // int result = hl + rp;
-        // alu.setCarryFlag(result > 0xFFFF);  // CY if overflow
-        // setRegisterPair("H", result & 0xFFFF);
+        int hl = getRegisterPair("H");
+        int rp = getRegisterPair(regPair);
+        int result = hl + rp;
+        alu.setCarryFlag(result > 0xFFFF);
+        setRegisterPair("H", result & 0xFFFF);
     }
 
     @Override
     public void daa() {
-        // TODO: Implement Decimal Adjust Accumulator for BCD arithmetic
-        //
-        // try {
-        //     int a = getRegister("A");
-        //     int correction = 0;
-        //     boolean newCarry = alu.isCarryFlag();
-        //
-        //     // Step 1: Adjust lower nibble
-        //     if ((a & 0x0F) > 9 || alu.isAuxCarryFlag()) {
-        //         correction += 0x06;
-        //     }
-        //
-        //     // Step 2: Adjust upper nibble
-        //     if (((a + correction) >> 4) > 9 || alu.isCarryFlag()) {
-        //         correction += 0x60;
-        //         newCarry = true;
-        //     }
-        //
-        //     int result = alu.add(a, correction, 0);
-        //     alu.setCarryFlag(newCarry);
-        //     setRegister("A", result);
-        // } catch (SimulatorException e) {
-        //     e.printStackTrace();
-        // }
+        try {
+            int a = getRegister("A");
+            int correction = 0;
+            boolean newCarry = alu.isCarryFlag();
+
+            if ((a & 0x0F) > 9 || alu.isAuxCarryFlag()) {
+                correction += 0x06;
+            }
+            if (((a + correction) >> 4) > 9 || alu.isCarryFlag()) {
+                correction += 0x60;
+                newCarry = true;
+            }
+            int result = alu.add(a, correction, 0);
+            alu.setCarryFlag(newCarry);
+            setRegister("A", result);
+        } catch (SimulatorException e) { throw new RuntimeException(e); }
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  LOGICAL INSTRUCTIONS
-    // ─────────────────────────────────────────────────────────────
+    // ─── Logical Instructions ────────────────────────────────────
 
     @Override
     public void ana(String src) throws SimulatorException {
-        // TODO: A = A AND src
-        //
-        // int a = getRegister("A");
-        // int operand = getOperandValue(src);
-        // int result = alu.and(a, operand);
-        // setRegister("A", result);
+        setRegister("A", alu.and(getRegister("A"), getOperandValue(src)));
     }
 
     @Override
     public void ani(int data) throws SimulatorException {
-        // TODO: A = A AND data
+        setRegister("A", alu.and(getRegister("A"), data));
     }
 
     @Override
     public void ora(String src) throws SimulatorException {
-        // TODO: A = A OR src
+        setRegister("A", alu.or(getRegister("A"), getOperandValue(src)));
     }
 
     @Override
     public void ori(int data) throws SimulatorException {
-        // TODO: A = A OR data
+        setRegister("A", alu.or(getRegister("A"), data));
     }
 
     @Override
     public void xra(String src) throws SimulatorException {
-        // TODO: A = A XOR src
+        setRegister("A", alu.xor(getRegister("A"), getOperandValue(src)));
     }
 
     @Override
     public void xri(int data) throws SimulatorException {
-        // TODO: A = A XOR data
+        setRegister("A", alu.xor(getRegister("A"), data));
     }
 
     @Override
     public void cmp(String src) throws SimulatorException {
-        // TODO: Compare A with src (subtract but don't store result)
-        //
-        // int a = getRegister("A");
-        // int operand = getOperandValue(src);
-        // alu.compare(a, operand);
-        // NOTE: A is NOT modified!
+        alu.compare(getRegister("A"), getOperandValue(src));
     }
 
     @Override
     public void cpi(int data) throws SimulatorException {
-        // TODO: Compare A with immediate data
+        alu.compare(getRegister("A"), data);
     }
 
     @Override
     public void rlc() {
-        // TODO: Rotate A left circular
-        //
-        // try {
-        //     int a = getRegister("A");
-        //     int bit7 = (a >> 7) & 1;
-        //     int result = ((a << 1) | bit7) & 0xFF;
-        //     alu.setCarryFlag(bit7 == 1);
-        //     setRegister("A", result);
-        // } catch (SimulatorException e) { e.printStackTrace(); }
+        try {
+            int a = getRegister("A");
+            int bit7 = (a >> 7) & 1;
+            setRegister("A", ((a << 1) | bit7) & 0xFF);
+            alu.setCarryFlag(bit7 == 1);
+        } catch (SimulatorException e) { throw new RuntimeException(e); }
     }
 
     @Override
     public void rrc() {
-        // TODO: Rotate A right circular
-        //
-        // try {
-        //     int a = getRegister("A");
-        //     int bit0 = a & 1;
-        //     int result = ((bit0 << 7) | (a >> 1)) & 0xFF;
-        //     alu.setCarryFlag(bit0 == 1);
-        //     setRegister("A", result);
-        // } catch (SimulatorException e) { e.printStackTrace(); }
+        try {
+            int a = getRegister("A");
+            int bit0 = a & 1;
+            setRegister("A", ((bit0 << 7) | (a >> 1)) & 0xFF);
+            alu.setCarryFlag(bit0 == 1);
+        } catch (SimulatorException e) { throw new RuntimeException(e); }
     }
 
     @Override
     public void ral() {
-        // TODO: Rotate A left through carry
-        //
-        // try {
-        //     int a = getRegister("A");
-        //     int oldCY = alu.isCarryFlag() ? 1 : 0;
-        //     alu.setCarryFlag(((a >> 7) & 1) == 1);
-        //     int result = ((a << 1) | oldCY) & 0xFF;
-        //     setRegister("A", result);
-        // } catch (SimulatorException e) { e.printStackTrace(); }
+        try {
+            int a = getRegister("A");
+            int oldCy = alu.isCarryFlag() ? 1 : 0;
+            alu.setCarryFlag(((a >> 7) & 1) == 1);
+            setRegister("A", ((a << 1) | oldCy) & 0xFF);
+        } catch (SimulatorException e) { throw new RuntimeException(e); }
     }
 
     @Override
     public void rar() {
-        // TODO: Rotate A right through carry
+        try {
+            int a = getRegister("A");
+            int oldCy = alu.isCarryFlag() ? 1 : 0;
+            alu.setCarryFlag((a & 1) == 1);
+            setRegister("A", ((oldCy << 7) | (a >> 1)) & 0xFF);
+        } catch (SimulatorException e) { throw new RuntimeException(e); }
     }
 
     @Override
     public void cma() {
-        // TODO: A = ~A (complement)
-        //
-        // try {
-        //     int a = getRegister("A");
-        //     setRegister("A", (~a) & 0xFF);
-        // } catch (SimulatorException e) { e.printStackTrace(); }
+        try { setRegister("A", (~getRegister("A")) & 0xFF); }
+        catch (SimulatorException e) { throw new RuntimeException(e); }
     }
 
     @Override
-    public void cmc() {
-        // TODO: CY = ~CY (complement carry)
-        //   alu.setCarryFlag(!alu.isCarryFlag());
-    }
+    public void cmc() { alu.setCarryFlag(!alu.isCarryFlag()); }
 
     @Override
-    public void stc() {
-        // TODO: CY = 1
-        //   alu.setCarryFlag(true);
-    }
+    public void stc() { alu.setCarryFlag(true); }
 
-    // ─────────────────────────────────────────────────────────────
-    //  BRANCHING INSTRUCTIONS
-    // ─────────────────────────────────────────────────────────────
+    // ─── Branching Instructions ──────────────────────────────────
 
-    @Override
-    public void jmp(int address) throws SimulatorException {
-        // TODO: PC = address (unconditional jump)
-        //   programCounter = address;
-    }
+    @Override public void jmp(int address) { programCounter = address & 0xFFFF; }
 
-    @Override
-    public void jc(int address) throws SimulatorException {
-        // TODO: if CY == 1, PC = address
-        //   if (alu.isCarryFlag()) programCounter = address;
-    }
+    @Override public void jc(int address) { if (alu.isCarryFlag()) programCounter = address; }
 
-    @Override
-    public void jnc(int address) throws SimulatorException {
-        // TODO: if CY == 0, PC = address
-    }
+    @Override public void jnc(int address) { if (!alu.isCarryFlag()) programCounter = address; }
 
-    @Override
-    public void jz(int address) throws SimulatorException {
-        // TODO: if Z == 1, PC = address
-    }
+    @Override public void jz(int address) { if (alu.isZeroFlag()) programCounter = address; }
 
-    @Override
-    public void jnz(int address) throws SimulatorException {
-        // TODO: if Z == 0, PC = address
-    }
+    @Override public void jnz(int address) { if (!alu.isZeroFlag()) programCounter = address; }
 
-    @Override
-    public void jp(int address) throws SimulatorException {
-        // TODO: if S == 0 (positive), PC = address
-    }
+    @Override public void jp(int address) { if (!alu.isSignFlag()) programCounter = address; }
 
-    @Override
-    public void jm(int address) throws SimulatorException {
-        // TODO: if S == 1 (minus/negative), PC = address
-    }
+    @Override public void jm(int address) { if (alu.isSignFlag()) programCounter = address; }
 
-    @Override
-    public void jpe(int address) throws SimulatorException {
-        // TODO: if P == 1 (even parity), PC = address
-    }
+    @Override public void jpe(int address) { if (alu.isParityFlag()) programCounter = address; }
 
-    @Override
-    public void jpo(int address) throws SimulatorException {
-        // TODO: if P == 0 (odd parity), PC = address
-    }
+    @Override public void jpo(int address) { if (!alu.isParityFlag()) programCounter = address; }
 
     @Override
     public void call(int address) throws SimulatorException {
-        // TODO: PUSH return address onto stack, then JMP
-        //
-        // LOGIC:
-        //   1. The return address is the address of the instruction AFTER this CALL
-        //      (which is PC + 3, since CALL is a 3-byte instruction).
-        //      NOTE: By the time this method is called from executeInstruction(),
-        //      PC may already be advanced — adjust accordingly.
-        //   2. Push high byte of return address:
-        //      stackPointer--;
-        //      writeMemory(stackPointer, (returnAddr >> 8) & 0xFF);
-        //   3. Push low byte:
-        //      stackPointer--;
-        //      writeMemory(stackPointer, returnAddr & 0xFF);
-        //   4. PC = address
+        // PC already advanced past the 3-byte CALL, so current PC is the return address
+        int returnAddr = programCounter;
+        stackPointer = (stackPointer - 1) & 0xFFFF;
+        writeMemory(stackPointer, (returnAddr >> 8) & 0xFF);
+        stackPointer = (stackPointer - 1) & 0xFFFF;
+        writeMemory(stackPointer, returnAddr & 0xFF);
+        programCounter = address & 0xFFFF;
     }
 
-    @Override public void cc(int address) throws SimulatorException {
-        // TODO: if CY == 1, call(address)
-    }
-    @Override public void cnc(int address) throws SimulatorException {
-        // TODO: if CY == 0, call(address)
-    }
-    @Override public void cz(int address) throws SimulatorException {
-        // TODO: if Z == 1, call(address)
-    }
-    @Override public void cnz(int address) throws SimulatorException {
-        // TODO: if Z == 0, call(address)
-    }
-    @Override public void cp(int address) throws SimulatorException {
-        // TODO: if S == 0, call(address)
-    }
-    @Override public void cm(int address) throws SimulatorException {
-        // TODO: if S == 1, call(address)
-    }
-    @Override public void cpe(int address) throws SimulatorException {
-        // TODO: if P == 1, call(address)
-    }
-    @Override public void cpo(int address) throws SimulatorException {
-        // TODO: if P == 0, call(address)
-    }
+    @Override public void cc(int address) throws SimulatorException  { if (alu.isCarryFlag()) call(address); }
+    @Override public void cnc(int address) throws SimulatorException { if (!alu.isCarryFlag()) call(address); }
+    @Override public void cz(int address) throws SimulatorException  { if (alu.isZeroFlag()) call(address); }
+    @Override public void cnz(int address) throws SimulatorException { if (!alu.isZeroFlag()) call(address); }
+    @Override public void cp(int address) throws SimulatorException  { if (!alu.isSignFlag()) call(address); }
+    @Override public void cm(int address) throws SimulatorException  { if (alu.isSignFlag()) call(address); }
+    @Override public void cpe(int address) throws SimulatorException { if (alu.isParityFlag()) call(address); }
+    @Override public void cpo(int address) throws SimulatorException { if (!alu.isParityFlag()) call(address); }
 
     @Override
     public void ret() throws SimulatorException {
-        // TODO: POP return address from stack, set PC
-        //
-        // int low  = readMemory(stackPointer); stackPointer++;
-        // int high = readMemory(stackPointer); stackPointer++;
-        // programCounter = (high << 8) | low;
+        int low = readMemory(stackPointer);
+        stackPointer = (stackPointer + 1) & 0xFFFF;
+        int high = readMemory(stackPointer);
+        stackPointer = (stackPointer + 1) & 0xFFFF;
+        programCounter = (high << 8) | low;
     }
 
-    @Override public void rc() throws SimulatorException {
-        // TODO: if CY == 1, ret()
-    }
-    @Override public void rnc() throws SimulatorException {
-        // TODO: if CY == 0, ret()
-    }
-    @Override public void rz() throws SimulatorException {
-        // TODO: if Z == 1, ret()
-    }
-    @Override public void rnz() throws SimulatorException {
-        // TODO: if Z == 0, ret()
-    }
-    @Override public void rp() throws SimulatorException {
-        // TODO: if S == 0, ret()
-    }
-    @Override public void rm() throws SimulatorException {
-        // TODO: if S == 1, ret()
-    }
-    @Override public void rpe() throws SimulatorException {
-        // TODO: if P == 1, ret()
-    }
-    @Override public void rpo() throws SimulatorException {
-        // TODO: if P == 0, ret()
-    }
+    @Override public void rc() throws SimulatorException  { if (alu.isCarryFlag()) ret(); }
+    @Override public void rnc() throws SimulatorException { if (!alu.isCarryFlag()) ret(); }
+    @Override public void rz() throws SimulatorException  { if (alu.isZeroFlag()) ret(); }
+    @Override public void rnz() throws SimulatorException { if (!alu.isZeroFlag()) ret(); }
+    @Override public void rp() throws SimulatorException  { if (!alu.isSignFlag()) ret(); }
+    @Override public void rm() throws SimulatorException  { if (alu.isSignFlag()) ret(); }
+    @Override public void rpe() throws SimulatorException { if (alu.isParityFlag()) ret(); }
+    @Override public void rpo() throws SimulatorException { if (!alu.isParityFlag()) ret(); }
 
     @Override
     public void rst(int n) throws SimulatorException {
-        // TODO: Push PC, then PC = n * 8
-        //
-        // if (n < 0 || n > 7)
-        //     throw new SimulatorException("Invalid RST number: " + n);
-        // call(n * 8);  // RST is essentially CALL to fixed addresses
+        if (n < 0 || n > 7)
+            throw new SimulatorException("Invalid RST number: " + n,
+                    SimulatorException.ErrorType.InvalidData);
+        call(n * 8);
     }
 
     @Override
     public void pchl() {
-        // TODO: PC = HL
-        //
-        // try {
-        //     programCounter = getHL();
-        // } catch (SimulatorException e) { e.printStackTrace(); }
+        try { programCounter = getHL(); }
+        catch (SimulatorException e) { throw new RuntimeException(e); }
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  STACK, I/O, AND MACHINE CONTROL INSTRUCTIONS
-    // ─────────────────────────────────────────────────────────────
+    // ─── Stack, I/O, Machine Control ─────────────────────────────
 
     @Override
     public void push(String regPair) throws SimulatorException {
-        // TODO: Push register pair onto stack
-        //
-        // int high, low;
-        // if (regPair.equalsIgnoreCase("PSW")) {
-        //     high = getRegister("A");
-        //     low  = alu.getFlagsByte();
-        // } else {
-        //     int value = getRegisterPair(regPair);
-        //     high = (value >> 8) & 0xFF;
-        //     low  = value & 0xFF;
-        // }
-        // stackPointer--;
-        // writeMemory(stackPointer, high);
-        // stackPointer--;
-        // writeMemory(stackPointer, low);
+        int high, low;
+        if (regPair.equalsIgnoreCase("PSW")) {
+            high = getRegister("A");
+            low = alu.getFlagsByte();
+        } else {
+            int value = getRegisterPair(regPair);
+            high = (value >> 8) & 0xFF;
+            low = value & 0xFF;
+        }
+        stackPointer = (stackPointer - 1) & 0xFFFF;
+        writeMemory(stackPointer, high);
+        stackPointer = (stackPointer - 1) & 0xFFFF;
+        writeMemory(stackPointer, low);
     }
 
     @Override
     public void pop(String regPair) throws SimulatorException {
-        // TODO: Pop register pair from stack
-        //
-        // int low  = readMemory(stackPointer); stackPointer++;
-        // int high = readMemory(stackPointer); stackPointer++;
-        //
-        // if (regPair.equalsIgnoreCase("PSW")) {
-        //     setRegister("A", high);
-        //     alu.setFlagsByte(low);
-        // } else {
-        //     setRegisterPair(regPair, (high << 8) | low);
-        // }
+        int low = readMemory(stackPointer);
+        stackPointer = (stackPointer + 1) & 0xFFFF;
+        int high = readMemory(stackPointer);
+        stackPointer = (stackPointer + 1) & 0xFFFF;
+        if (regPair.equalsIgnoreCase("PSW")) {
+            setRegister("A", high);
+            alu.setFlagsByte(low);
+        } else {
+            setRegisterPair(regPair, (high << 8) | low);
+        }
     }
 
     @Override
     public void xthl() throws SimulatorException {
-        // TODO: Exchange HL with top of stack
-        //
-        // int memLow  = readMemory(stackPointer);
-        // int memHigh = readMemory(stackPointer + 1);
-        //
-        // writeMemory(stackPointer, getRegister("L"));
-        // writeMemory(stackPointer + 1, getRegister("H"));
-        //
-        // setRegister("L", memLow);
-        // setRegister("H", memHigh);
+        int memLow = readMemory(stackPointer);
+        int memHigh = readMemory((stackPointer + 1) & 0xFFFF);
+        writeMemory(stackPointer, getRegister("L"));
+        writeMemory((stackPointer + 1) & 0xFFFF, getRegister("H"));
+        setRegister("L", memLow);
+        setRegister("H", memHigh);
     }
 
     @Override
     public void sphl() {
-        // TODO: SP = HL
-        //
-        // try {
-        //     stackPointer = getHL();
-        // } catch (SimulatorException e) { e.printStackTrace(); }
+        try { stackPointer = getHL(); }
+        catch (SimulatorException e) { throw new RuntimeException(e); }
     }
 
     @Override
     public void in(int port) throws SimulatorException {
-        // TODO: A = input from port
-        //
-        // int value = ioPorts.getOrDefault(port, 0x00);
-        // setRegister("A", value);
+        setRegister("A", ioPorts.getOrDefault(port & 0xFF, 0x00));
     }
 
     @Override
     public void out(int port) throws SimulatorException {
-        // TODO: Output A to port
-        //
-        // ioPorts.put(port, getRegister("A"));
+        ioPorts.put(port & 0xFF, getRegister("A"));
     }
 
-    @Override
-    public void hlt() {
-        // TODO: Set halted flag
-        //   halted = true;
-    }
+    @Override public void hlt() { halted = true; }
+    @Override public void nop() { /* do nothing */ }
+    @Override public void ei() { interruptsEnabled = true; }
+    @Override public void di() { interruptsEnabled = false; }
+    @Override public void rim() { try { setRegister("A", 0x00); } catch (SimulatorException e) { throw new RuntimeException(e); } }
+    @Override public void sim() { /* simplified: no-op */ }
 
-    @Override
-    public void nop() {
-        // Do nothing — this is correct!
-        // PC advancement happens in executeInstruction()
-    }
+    // ─── State Inspection ────────────────────────────────────────
 
-    @Override
-    public void ei() {
-        // TODO: Enable interrupts
-        //   interruptsEnabled = true;
-    }
-
-    @Override
-    public void di() {
-        // TODO: Disable interrupts
-        //   interruptsEnabled = false;
-    }
-
-    @Override
-    public void rim() {
-        // TODO: Read Interrupt Mask into A (simplified)
-        //   Basic implementation: setRegister("A", 0x00);
-    }
-
-    @Override
-    public void sim() {
-        // TODO: Set Interrupt Mask from A (simplified)
-        //   Basic implementation: no-op for now
-    }
-
-
-    // ╔═══════════════════════════════════════════════════════════════╗
-    // ║  SECTION 9: STATE INSPECTION (for UserInterface)             ║
-    // ╚═══════════════════════════════════════════════════════════════╝
-
-    /**
-     * Returns a complete snapshot of the CPU state for display.
-     *
-     * @return Formatted multi-line string showing all registers, PC, SP, flags
-     */
     public String getCPUState() {
-        // TODO: Build and return formatted CPU state
-        //
-        // StringBuilder sb = new StringBuilder();
-        // sb.append("╔══════════════════════════════════════╗\n");
-        // sb.append("║         8085 CPU STATE               ║\n");
-        // sb.append("╠══════════════════════════════════════╣\n");
-        // sb.append(String.format("║  A  = %02XH                          ║\n", getRegister("A")));
-        // sb.append(String.format("║  B  = %02XH   C  = %02XH              ║\n", ...));
-        // sb.append(String.format("║  D  = %02XH   E  = %02XH              ║\n", ...));
-        // sb.append(String.format("║  H  = %02XH   L  = %02XH              ║\n", ...));
-        // sb.append(String.format("║  SP = %04XH  PC = %04XH            ║\n", stackPointer, programCounter));
-        // sb.append("║  Flags: " + alu.flagsToString() + "  ║\n");
-        // sb.append("╚══════════════════════════════════════╝\n");
-        // return sb.toString();
-        return "CPU state display not implemented"; // placeholder
+        try {
+            StringBuilder sb = new StringBuilder();
+            sb.append("╔══════════════════════════════════════╗\n");
+            sb.append("║         8085 CPU STATE               ║\n");
+            sb.append("╠══════════════════════════════════════╣\n");
+            sb.append(String.format("║  A  = %02XH                          ║%n", getRegister("A")));
+            sb.append(String.format("║  B  = %02XH   C  = %02XH              ║%n", getRegister("B"), getRegister("C")));
+            sb.append(String.format("║  D  = %02XH   E  = %02XH              ║%n", getRegister("D"), getRegister("E")));
+            sb.append(String.format("║  H  = %02XH   L  = %02XH              ║%n", getRegister("H"), getRegister("L")));
+            sb.append(String.format("║  SP = %04XH  PC = %04XH            ║%n", stackPointer, programCounter));
+            sb.append("║  Flags: ").append(alu.flagsToString()).append("  ║\n");
+            sb.append("╚══════════════════════════════════════╝\n");
+            return sb.toString();
+        } catch (SimulatorException e) { return "Error reading CPU state: " + e.getMessage(); }
     }
 
-    /**
-     * Resets the entire CPU to power-on state.
-     *
-     * LOGIC:
-     *   1. Reset all registers to 0
-     *   2. Reset PC = 0x0000, SP = 0xFFFF
-     *   3. Reset all flags
-     *   4. Reset memory
-     *   5. Clear halted flag
-     */
     public void reset() {
-        // TODO: Full CPU reset
-        //
-        // initRegisters();
-        // programCounter = 0x0000;
-        // stackPointer = 0xFFFF;
-        // alu.resetFlags();
-        // resetMemory();
-        // halted = false;
-        // interruptsEnabled = false;
-        // ioPorts.clear();
+        initRegisters();
+        programCounter = 0x0000;
+        stackPointer = 0xFFFF;
+        alu.resetFlags();
+        resetMemory();
+        halted = false;
+        interruptsEnabled = false;
+        ioPorts.clear();
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    //  GETTERS for UserInterface access
-    // ═══════════════════════════════════════════════════════════════
+    // ─── Getters/Setters for UI ──────────────────────────────────
 
     public int getProgramCounter() { return programCounter; }
     public void setProgramCounter(int pc) { this.programCounter = pc & 0xFFFF; }
-
     public int getStackPointer() { return stackPointer; }
     public void setStackPointer(int sp) { this.stackPointer = sp & 0xFFFF; }
-
     public boolean isHalted() { return halted; }
     public ALU getALU() { return alu; }
-
     public HashMap<String, Integer> getGeneralRegisters() { return generalRegisters; }
     public HashMap<String, Integer> getSpecialRegisters() { return specialRegisters; }
 }
