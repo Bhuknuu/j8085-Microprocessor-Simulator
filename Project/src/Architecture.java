@@ -909,15 +909,15 @@ public class Architecture implements Memory, InstrucSet {
         try {
             StringBuilder sb = new StringBuilder();
             sb.append("╔══════════════════════════════════════╗\n");
-            sb.append("║         8085 CPU STATE               ║\n");
+            sb.append("║      Internal Register State         ║\n");
             sb.append("╠══════════════════════════════════════╣\n");
-            sb.append(String.format("║  A  = %02XH                          ║%n", getRegister("A")));
-            sb.append(String.format("║  B  = %02XH   C  = %02XH              ║%n", getRegister("B"), getRegister("C")));
-            sb.append(String.format("║  D  = %02XH   E  = %02XH              ║%n", getRegister("D"), getRegister("E")));
-            sb.append(String.format("║  H  = %02XH   L  = %02XH              ║%n", getRegister("H"), getRegister("L")));
-            sb.append(String.format("║  SP = %04XH  PC = %04XH            ║%n", stackPointer, programCounter));
-            sb.append("║  Flags: ").append(alu.flagsToString()).append("  ║\n");
-            sb.append("╚══════════════════════════════════════╝\n");
+            sb.append(String.format("  A  = %02XH                          %n", getRegister("A")));
+            sb.append(String.format("  B  = %02XH   C  = %02XH             %n", getRegister("B"), getRegister("C")));
+            sb.append(String.format("  D  = %02XH   E  = %02XH             %n", getRegister("D"), getRegister("E")));
+            sb.append(String.format("  H  = %02XH   L  = %02XH             %n", getRegister("H"), getRegister("L")));
+            sb.append(String.format("  SP = %04XH  PC = %04XH              %n", stackPointer, programCounter));
+            sb.append("  Flags: ").append(alu.flagsToString());
+            sb.append("\n════════════════════════════════════════\n");
             return sb.toString();
         } catch (SimulatorException e) { return "Error reading CPU state: " + e.getMessage(); }
     }

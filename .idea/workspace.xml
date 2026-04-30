@@ -1,7 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="aa29dbef-96bb-46f4-9afb-c79a763c0b15" name="Changes" comment="Finish up with the phase two of the project with minimal implementation of assembler architecture alu main instruction set memory op code and simulation exception file With a basic ui Command line &#10;&#10;Attach Complete documentation of Project with date sheet In the documentation Folder For further death In understanding User who are interested in the projects" />
+    <list default="true" id="aa29dbef-96bb-46f4-9afb-c79a763c0b15" name="Changes" comment="Finish up with the phase two of the project with minimal implementation of assembler architecture alu main instruction set memory op code and simulation exception file With a basic ui Command line &#10;&#10;Attach Complete documentation of Project with date sheet In the documentation Folder For further death In understanding User who are interested in the projects">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/AsemblyProgram/AddTwoNumbers.asm" beforeDir="false" afterPath="$PROJECT_DIR$/AsemblyProgram/AddTwoNumbers.asm" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Doc/documentation/j8085_complete_documentation.html" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/Project/src/Architecture.java" beforeDir="false" afterPath="$PROJECT_DIR$/Project/src/Architecture.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Project/src/EmulatorBridge.java" beforeDir="false" afterPath="$PROJECT_DIR$/Project/src/EmulatorBridge.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Project/src/InstrucSet.java" beforeDir="false" afterPath="$PROJECT_DIR$/Project/src/InstrucSet.java" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -27,8 +34,8 @@
 }</component>
   <component name="GithubPullRequestsUISettings">{
   &quot;selectedUrlAndAccountId&quot;: {
-    &quot;url&quot;: &quot;https://github.com/Bhuknuu/j8085-Microprocessor-Simulator.git&quot;,
-    &quot;accountId&quot;: &quot;78f94e94-e18e-447a-a510-9eadacba1d57&quot;
+    &quot;url&quot;: &quot;https://github.com/Bhuknuu/j8085-Microprocessor-Emulator&quot;,
+    &quot;accountId&quot;: &quot;a1be1a35-7ac1-4078-abd9-55f5899d0f74&quot;
   }
 }</component>
   <component name="ProblemsViewState">

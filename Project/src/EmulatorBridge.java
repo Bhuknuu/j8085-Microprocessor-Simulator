@@ -15,7 +15,6 @@ public class EmulatorBridge {
     }
     public void setArchitecture(Architecture arch){this.arch=arch;refreshUI();}
     public Architecture getArchitecture(){return arch;}
-    public void refreshUI(){if(dashboard!=null)dashboard.refresh(arch.createSnapshot());}
 
     public void assembleAndLoad(){
         if(isRunning.get()){terminal.appendError("Pause before assembling.");return;}
@@ -91,7 +90,7 @@ public class EmulatorBridge {
     public Set<Integer> getBreakpoints(){return breakpoints;}
 
     // [AG-FIX 1.1] Snapshot on caller thread, render on EDT
-    private void refreshUI(){
+    public void refreshUI(){
         int pc=arch.getProgramCounter();
         int[] range=dashboard.getMemRange(pc);
         CPUSnapshot snap=arch.getCPUSnapshot(range[0],range[1]);
