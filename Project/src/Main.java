@@ -3,7 +3,8 @@ public class Main {
     public static void main(String[] args){
         MainFrame.setupDarkTheme();
         SwingUtilities.invokeLater(()->{
-            MemoryConfigDialog dlg=new MemoryConfigDialog(null); dlg.setVisible(true);
+            MemoryConfigDialog dlg=new MemoryConfigDialog(null); 
+            dlg.setVisible(true);
             if(!dlg.isUserConfirmed()){System.exit(0);return;}
             try{
                 Architecture arch=dlg.isDefaultSelected()?new Architecture():new Architecture(dlg.getStartAddress(),dlg.getEndAddress());

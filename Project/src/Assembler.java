@@ -1,6 +1,6 @@
-import java.util.List;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 
 // Assembler — Two-pass assembly: labels first, then machine code generation
 public class Assembler {
@@ -14,12 +14,6 @@ public class Assembler {
         this.originAddress = 0x2000;
     }
 
-    /**
-     * [CRITICAL FIX] assembleToBuffer — generates machine code bytes into a pure
-     * int[] buffer WITHOUT writing to Architecture memory.
-     * Callers must call arch.loadProgram() only after this succeeds.
-     * This prevents partial memory corruption when assembly fails mid-way.
-     */
     public int[] assembleToBuffer(String program, int startAddress) throws SimulatorException {
         this.originAddress = startAddress;
         this.symbolTable.clear();
@@ -28,7 +22,7 @@ public class Assembler {
         // Pass 1: collect labels and handle ORG relocations
         int currentAddress = startAddress;
         for (String line : lines) {
-            line = stripComment(line).trim();
+            line = stripComment(line).trim();  
             if (line.isEmpty()) continue;
             if (line.contains(":")) {
                 int idx = line.indexOf(':');
@@ -36,7 +30,7 @@ public class Assembler {
                 line = line.substring(idx + 1).trim();
                 if (line.isEmpty()) continue;
             }
-            // [AG-FIX 1.5] ORG: relocate address counter
+            
             String upper = line.toUpperCase();
             if (upper.startsWith("ORG")) {
                 int orgAddr = parseImm16(line.substring(3).trim());
